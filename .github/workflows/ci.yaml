@@ -28,8 +28,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # cmake too: macos-14's image had it, macos-15's does not ("mbedtls|
+      # Found CMake: NO"). The build links what it needs from the PATH here
+      # into a PATH of its own.
       - name: Install requirements
-        run: brew install go meson ninja nasm make
+        run: brew install go meson ninja nasm make cmake
 
       - name: Print tool versions
         run: gmake tool-versions
