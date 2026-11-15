@@ -46,6 +46,8 @@ let
     patch -p1 <${../../../patches/ffmpeg-fix-hls-mp4-seek.patch}
     patch -p1 <${../../../patches/ffmpeg-fix-ios-hdr-texture.patch}
     patch -p1 <${../../../patches/ffmpeg-fix-dash-base-url-escape.patch}
+    # After ffmpeg-fix-ios-hdr-texture.patch (the same file).
+    patch -p1 <${../../../patches/ffmpeg-videotoolbox-async.patch}
     cd -
 
     cp ${./meson.build} $src/meson.build

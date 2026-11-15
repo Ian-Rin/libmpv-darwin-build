@@ -1,0 +1,301 @@
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+index a2d2cee..bc57157 100644
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -28,6 +28,7 @@
+ #include "libavutil/avutil.h"
+ #include "libavutil/hwcontext.h"
+ #include "libavutil/pixdesc.h"
++#include "libavutil/time.h"
+ #include "bytestream.h"
+ #include "decode.h"
+ #include "internal.h"
+@@ -38,6 +39,7 @@
+ #include <Availability.h>
+ #include <AvailabilityMacros.h>
+ #include <TargetConditionals.h>
++#include <pthread.h>
+ 
+ #ifndef kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder
+ #  define kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder CFSTR("RequireHardwareAcceleratedVideoDecoder")
+@@ -59,6 +61,16 @@ enum { kCMVideoCodecType_VP9 = 'vp09' };
+ typedef struct VTHWFrame {
+     CVPixelBufferRef pixbuf;
+     AVBufferRef *hw_frames_ctx;
++
++    // Decoding is asynchronous: a frame is given to the session as it is
++    // parsed (end_frame) and its picture is waited for only as the frame is
++    // output (videotoolbox_postproc_frame), so that the session has several
++    // frames to work on at once. Waiting for each picture before the next
++    // frame was given, a 4K stream came out at some 125 frames a second.
++    pthread_mutex_t lock;
++    pthread_cond_t  cond;
++    int      pending;   // given to the session, their callbacks not yet run
++    OSStatus status;    // what the last callback was told
+ } VTHWFrame;
+ 
+ static void videotoolbox_buffer_release(void *opaque, uint8_t *data)
+@@ -66,10 +78,14 @@ static void videotoolbox_buffer_release(void *opaque, uint8_t *data)
+     VTHWFrame *ref = (VTHWFrame *)data;
+     av_buffer_unref(&ref->hw_frames_ctx);
+     CVPixelBufferRelease(ref->pixbuf);
++    pthread_cond_destroy(&ref->cond);
++    pthread_mutex_destroy(&ref->lock);
+ 
+     av_free(data);
+ }
+ 
++static int videotoolbox_frames_ctx(AVCodecContext *avctx, VTHWFrame *ref);
++
+ int ff_videotoolbox_buffer_copy(VTContext *vtctx,
+                                 const uint8_t *buffer,
+                                 uint32_t size)
+@@ -94,13 +110,40 @@ static int videotoolbox_postproc_frame(void *avctx, AVFrame *frame)
+ {
+     int ret;
+     VTHWFrame *ref = (VTHWFrame *)frame->buf[0]->data;
+-
+-    if (!ref->pixbuf) {
+-        av_log(avctx, AV_LOG_ERROR, "No frame decoded?\n");
++    OSStatus status;
++    CVPixelBufferRef pixbuf;
++    // Two seconds at most: a session that never calls back (it is not said
++    // that one invalidated by the system does) must not hold the decoder,
++    // and whoever waits on it, for good. The frame then counts as failed.
++    int64_t deadline = av_gettime() + 2000000;
++    struct timespec until = {
++        .tv_sec  = deadline / 1000000,
++        .tv_nsec = (deadline % 1000000) * 1000,
++    };
++
++    // The picture of this frame may still be on its way.
++    pthread_mutex_lock(&ref->lock);
++    while (ref->pending > 0 && av_gettime() < deadline)
++        pthread_cond_timedwait(&ref->cond, &ref->lock, &until);
++    status = ref->status;
++    pixbuf = ref->pending > 0 ? NULL : ref->pixbuf;
++    pthread_mutex_unlock(&ref->lock);
++
++    if (!pixbuf) {
++        AVCodecContext *ctx = avctx;
++        VTContext *vtctx = ctx->internal ? ctx->internal->hwaccel_priv_data : NULL;
++        // As for a frame that came back without a picture while it was
++        // waited for in end_frame: the session is made anew.
++        if (vtctx)
++            vtctx->reconfig_needed = true;
++        av_log(avctx, AV_LOG_ERROR, "No frame decoded? (%d)\n", (int)status);
+         av_frame_unref(frame);
+         return AVERROR_EXTERNAL;
+     }
+ 
++    if ((ret = videotoolbox_frames_ctx(avctx, ref)) < 0)
++        return ret;
++
+     frame->crop_right = 0;
+     frame->crop_left = 0;
+     frame->crop_top = 0;
+@@ -134,8 +177,19 @@ int ff_videotoolbox_alloc_frame(AVCodecContext *avctx, AVFrame *frame)
+     data = av_mallocz(size);
+     if (!data)
+         return AVERROR(ENOMEM);
++    if (pthread_mutex_init(&((VTHWFrame *)data)->lock, NULL)) {
++        av_freep(&data);
++        return AVERROR(ENOMEM);
++    }
++    if (pthread_cond_init(&((VTHWFrame *)data)->cond, NULL)) {
++        pthread_mutex_destroy(&((VTHWFrame *)data)->lock);
++        av_freep(&data);
++        return AVERROR(ENOMEM);
++    }
+     buf = av_buffer_create(data, size, videotoolbox_buffer_release, NULL, 0);
+     if (!buf) {
++        pthread_cond_destroy(&((VTHWFrame *)data)->cond);
++        pthread_mutex_destroy(&((VTHWFrame *)data)->lock);
+         av_freep(&data);
+         return AVERROR(ENOMEM);
+     }
+@@ -487,6 +541,9 @@ static void videotoolbox_stop(AVCodecContext *avctx)
+     }
+ 
+     if (videotoolbox->session) {
++        // The frames it still works on come back first: their callbacks
++        // are not to run once the session and its context are gone.
++        VTDecompressionSessionWaitForAsynchronousFrames(videotoolbox->session);
+         VTDecompressionSessionInvalidate(videotoolbox->session);
+         CFRelease(videotoolbox->session);
+         videotoolbox->session = NULL;
+@@ -512,33 +569,21 @@ int ff_videotoolbox_uninit(AVCodecContext *avctx)
+     return 0;
+ }
+ 
+-static int videotoolbox_buffer_create(AVCodecContext *avctx, AVFrame *frame)
++// The frames context for the picture a frame got (its format and size are
++// the picture's). As the frame is output: its picture is there then.
++static int videotoolbox_frames_ctx(AVCodecContext *avctx, VTHWFrame *ref)
+ {
+-    VTContext *vtctx = avctx->internal->hwaccel_priv_data;
+-    CVPixelBufferRef pixbuf = (CVPixelBufferRef)vtctx->frame;
++    VTContext *vtctx = avctx->internal ? avctx->internal->hwaccel_priv_data : NULL;
++    CVPixelBufferRef pixbuf = ref->pixbuf;
+     OSType pixel_format = CVPixelBufferGetPixelFormatType(pixbuf);
+     enum AVPixelFormat sw_format = av_map_videotoolbox_format_to_pixfmt(pixel_format);
+     int width = CVPixelBufferGetWidth(pixbuf);
+     int height = CVPixelBufferGetHeight(pixbuf);
+     AVHWFramesContext *cached_frames;
+-    VTHWFrame *ref;
+     int ret;
+ 
+-    if (!frame->buf[0] || frame->data[3]) {
+-        av_log(avctx, AV_LOG_ERROR, "videotoolbox: invalid state\n");
+-        av_frame_unref(frame);
+-        return AVERROR_EXTERNAL;
+-    }
+-
+-    ref = (VTHWFrame *)frame->buf[0]->data;
+-
+-    if (ref->pixbuf)
+-        CVPixelBufferRelease(ref->pixbuf);
+-    ref->pixbuf = vtctx->frame;
+-    vtctx->frame = NULL;
+-
+     // Old API code path.
+-    if (!vtctx->cached_hw_frames_ctx)
++    if (!vtctx || !vtctx->cached_hw_frames_ctx)
+         return 0;
+ 
+     cached_frames = (AVHWFramesContext*)vtctx->cached_hw_frames_ctx->data;
+@@ -691,27 +736,48 @@ static void videotoolbox_decoder_callback(void *opaque,
+                                           CMTime duration)
+ {
+     VTContext *vtctx = opaque;
+-
+-    if (vtctx->frame) {
+-        CVPixelBufferRelease(vtctx->frame);
+-        vtctx->frame = NULL;
+-    }
++    // The reference videotoolbox_session_decode_frame took for this call:
++    // the frame itself may be gone by now (a seek drops what was decoded).
++    AVBufferRef *buf = sourceFrameRefCon;
++    VTHWFrame *ref;
+ 
+     if (!image_buffer) {
+         av_log(vtctx->logctx, status ? AV_LOG_WARNING : AV_LOG_DEBUG,
+                "vt decoder cb: output image buffer is null: %i\n", status);
+-        return;
+     }
+ 
+-    vtctx->frame = CVPixelBufferRetain(image_buffer);
++    if (!buf)
++        return;
++
++    ref = (VTHWFrame *)buf->data;
++
++    pthread_mutex_lock(&ref->lock);
++    if (ref->pixbuf) {
++        CVPixelBufferRelease(ref->pixbuf);
++        ref->pixbuf = NULL;
++    }
++    if (image_buffer)
++        ref->pixbuf = CVPixelBufferRetain(image_buffer);
++    ref->status = status;
++    if (ref->pending > 0)
++        ref->pending--;
++    pthread_cond_broadcast(&ref->cond);
++    pthread_mutex_unlock(&ref->lock);
++
++    av_buffer_unref(&buf);
+ }
+ 
+-static OSStatus videotoolbox_session_decode_frame(AVCodecContext *avctx)
++// Gives the frame to the session and returns: its picture comes to the
++// callback, on a thread of the session's.
++static OSStatus videotoolbox_session_decode_frame(AVCodecContext *avctx,
++                                                  AVFrame *frame)
+ {
+     OSStatus status;
+     CMSampleBufferRef sample_buf;
+     AVVideotoolboxContext *videotoolbox = videotoolbox_get_context(avctx);
+     VTContext *vtctx = avctx->internal->hwaccel_priv_data;
++    AVBufferRef *buf;
++    VTHWFrame *ref;
+ 
+     sample_buf = videotoolbox_sample_buffer_create(videotoolbox->cm_fmt_desc,
+                                                    vtctx->bitstream,
+@@ -720,16 +786,41 @@ static OSStatus videotoolbox_session_decode_frame(AVCodecContext *avctx)
+     if (!sample_buf)
+         return -1;
+ 
++    buf = av_buffer_ref(frame->buf[0]);
++    if (!buf) {
++        CFRelease(sample_buf);
++        return -1;
++    }
++    ref = (VTHWFrame *)buf->data;
++
++    pthread_mutex_lock(&ref->lock);
++    ref->pending++;
++    pthread_mutex_unlock(&ref->lock);
++
+     status = VTDecompressionSessionDecodeFrame(videotoolbox->session,
+                                                sample_buf,
+-                                               0,       // decodeFlags
+-                                               NULL,    // sourceFrameRefCon
+-                                               0);      // infoFlagsOut
+-    if (status == noErr)
+-        status = VTDecompressionSessionWaitForAsynchronousFrames(videotoolbox->session);
++                                               kVTDecodeFrame_EnableAsynchronousDecompression,
++                                               buf,     // sourceFrameRefCon
++                                               NULL);   // infoFlagsOut
+ 
+     CFRelease(sample_buf);
+ 
++    if (status != noErr) {
++        // Not taken, so no callback comes for it: its count and its
++        // reference are let go of here.
++        int ours = 0;
++        pthread_mutex_lock(&ref->lock);
++        if (ref->pending > 0) {
++            ref->pending--;
++            ours = 1;
++        }
++        ref->status = status;
++        pthread_cond_broadcast(&ref->cond);
++        pthread_mutex_unlock(&ref->lock);
++        if (ours)
++            av_buffer_unref(&buf);
++    }
++
+     return status;
+ }
+ 
+@@ -1018,7 +1109,13 @@ int ff_videotoolbox_common_end_frame(AVCodecContext *avctx, AVFrame *frame)
+     if (!videotoolbox->session || !vtctx->bitstream || !vtctx->bitstream_size)
+         return AVERROR_INVALIDDATA;
+ 
+-    status = videotoolbox_session_decode_frame(avctx);
++    if (!frame->buf[0] || frame->data[3]) {
++        av_log(avctx, AV_LOG_ERROR, "videotoolbox: invalid state\n");
++        av_frame_unref(frame);
++        return AVERROR_EXTERNAL;
++    }
++
++    status = videotoolbox_session_decode_frame(avctx, frame);
+     if (status != noErr) {
+         if (status == kVTVideoDecoderMalfunctionErr || status == kVTInvalidSessionErr)
+             vtctx->reconfig_needed = true;
+@@ -1026,12 +1123,9 @@ int ff_videotoolbox_common_end_frame(AVCodecContext *avctx, AVFrame *frame)
+         return AVERROR_UNKNOWN;
+     }
+ 
+-    if (!vtctx->frame) {
+-        vtctx->reconfig_needed = true;
+-        return AVERROR_UNKNOWN;
+-    }
+-
+-    return videotoolbox_buffer_create(avctx, frame);
++    // The picture is waited for as the frame is output
++    // (videotoolbox_postproc_frame); a frame that got none fails there.
++    return 0;
+ }
+ 
+ static int videotoolbox_h264_end_frame(AVCodecContext *avctx)

@@ -1,3 +1,11 @@
+# This fork builds the one archive PiliPlus takes, the iOS video
+# xcframeworks (default flavor), with ffmpeg patched to decode through
+# VideoToolbox without waiting for each frame
+# (patches/ffmpeg-videotoolbox-async.patch). Upstream's workflow builds
+# all 246.
+#
+# A tag builds a release with the archive attached; a push to main or a
+# run by hand builds the same and keeps it as the run's artifact.
 name: ci
 
 on:
@@ -6,9 +14,11 @@ on:
       - main
     tags:
       - "*"
-  pull_request:
-    branches:
-      - "*"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   ci:
@@ -67,8 +77,34 @@ jobs:
         env:
           XCODE_PATH: ${{ steps.xcode_path.outputs.xcode_path }}
           VERSION: ${{ steps.version.outputs.version }}
+        # bash, for pipefail: the build's failure, not tee's success.
+        shell: bash
         run: |
-          nix develop -c make XCODE_PATH=${XCODE_PATH} VERSION=${VERSION}
+          nix develop -c make XCODE_PATH=${XCODE_PATH} VERSION=${VERSION} \n            TARGET=mk-out-archive-xcframeworks-ios-universal-video-default 2>&1 | tee build.log
+
+      # A run's log needs a login to read; its annotations do not. The lines
+      # that say what failed, and the log's end, go there.
+      - name: Say why the build failed
+        if: failure()
+        shell: bash
+        run: |
+          test -f build.log || exit 0
+          annotate() {
+            local title=$1 body
+            body=$(sed -e 's/%/%25/g' | cut -c1-300 | awk '{printf "%s%%0A", $0}')
+            test -n "$body" && echo "::error title=${title}::${body}"
+            return 0
+          }
+          grep -n -E "error:|Error:|FAILED|fatal error|No such file" build.log | tail -n 30 | annotate "errors in the build log"
+          tail -n 90 build.log | head -n 30 | annotate "build log 90 to 60 lines from its end"
+          tail -n 60 build.log | head -n 30 | annotate "build log 60 to 30 lines from its end"
+          tail -n 30 build.log | annotate "build log last 30 lines"
+
+      - name: Checksum
+        shell: bash
+        run: |
+          cd result
+          echo "::notice title=sha256::$(shasum -a 256 *.tar.gz | awk '{printf "%s  %s%%0A", $1, $2}')"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
