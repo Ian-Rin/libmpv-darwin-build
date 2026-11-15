@@ -80,7 +80,7 @@ jobs:
         # bash, for pipefail: the build's failure, not tee's success.
         shell: bash
         run: |
-          nix develop -c make XCODE_PATH=${XCODE_PATH} VERSION=${VERSION} \n            TARGET=mk-out-archive-xcframeworks-ios-universal-video-default 2>&1 | tee build.log
+          nix develop -c make XCODE_PATH=${XCODE_PATH} VERSION=${VERSION} TARGET=mk-out-archive-xcframeworks-ios-universal-video-default 2>&1 | tee build.log
 
       # A run's log needs a login to read; its annotations do not. The lines
       # that say what failed, and the log's end, go there.
