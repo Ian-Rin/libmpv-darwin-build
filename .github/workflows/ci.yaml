@@ -88,7 +88,11 @@ jobs:
         if: failure()
         shell: bash
         run: |
+          # grep finding nothing must not end this step (bash here has
+          # -e and pipefail): it did, and the failure said nothing.
+          set +e +o pipefail
           test -f build.log || exit 0
+          echo "::error title=build log size::$(wc -l < build.log) lines"
           annotate() {
             local title=$1 body
             body=$(sed -e 's/%/%25/g' | cut -c1-300 | awk '{printf "%s%%0A", $0}')
@@ -99,6 +103,7 @@ jobs:
           tail -n 90 build.log | head -n 30 | annotate "build log 90 to 60 lines from its end"
           tail -n 60 build.log | head -n 30 | annotate "build log 60 to 30 lines from its end"
           tail -n 30 build.log | annotate "build log last 30 lines"
+          head -n 30 build.log | annotate "build log first 30 lines"
 
       - name: Checksum
         shell: bash
