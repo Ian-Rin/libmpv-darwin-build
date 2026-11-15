@@ -17,6 +17,7 @@ meson compile -C build_cross uchardet
 cmake ./subprojects/uchardet \
     -B build_native \
     -DCMAKE_INSTALL_PREFIX="${OUTPUT_DIR}" \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DBUILD_STATIC=OFF
 make -C build_native
 DESTDIR=$PWD/dist make -C build_native install
