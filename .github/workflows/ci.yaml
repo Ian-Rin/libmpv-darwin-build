@@ -19,7 +19,9 @@ concurrency:
 jobs:
   ci:
     name: ci
-    runs-on: macos-14
+    # macos-14, which this was built on until November 2026, is gone ("The
+    # configuration 'macos-14-arm64-us-default' is not supported").
+    runs-on: macos-15
     permissions:
       contents: write
     steps:
