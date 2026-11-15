@@ -37,6 +37,15 @@ jobs:
       - name: Print tool versions
         run: gmake tool-versions
 
+      # Readable without a login, as the failure below: which tools the
+      # build will link into its own PATH.
+      - name: Say where the tools are
+        shell: bash
+        run: |
+          for tool in meson ninja cmake nasm; do
+            echo "::notice title=tool ${tool}::$(which ${tool} || echo missing) $(${tool} --version 2>&1 | head -n 1)"
+          done
+
       - name: Determine version
         id: version
         shell: bash
@@ -74,9 +83,9 @@ jobs:
             return 0
           }
           grep -n -E "error:|Error:|FAILED|fatal|undefined|Undefined|No such file|not found" build.log | tail -n 30 | annotate "errors in the build log"
-          tail -n 90 build.log | head -n 30 | annotate "build log, 90 to 60 lines from its end"
-          tail -n 60 build.log | head -n 30 | annotate "build log, 60 to 30 lines from its end"
-          tail -n 30 build.log | annotate "build log, its last 30 lines"
+          tail -n 90 build.log | head -n 30 | annotate "build log 90 to 60 lines from its end"
+          tail -n 60 build.log | head -n 30 | annotate "build log 60 to 30 lines from its end"
+          tail -n 30 build.log | annotate "build log last 30 lines"
 
       - name: Checksum
         shell: bash
