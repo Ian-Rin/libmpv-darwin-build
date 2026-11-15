@@ -9,6 +9,7 @@ cd ${SRC_DIR}
 cp ${PROJECT_DIR}/scripts/uchardet/meson.build ./meson.build
 meson setup build_cross \
     --cross-file ${PROJECT_DIR}/cross-files/${OS}-${ARCH}.ini \
+    --cross-file ${PROJECT_DIR}/cross-files/cmake.ini \
     --prefix="${OUTPUT_DIR}"
 meson compile -C build_cross uchardet
 
