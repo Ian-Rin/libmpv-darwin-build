@@ -26,7 +26,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # cmake too: macos-14's image had it, macos-15's does not ("mbedtls|
       # Found CMake: NO"). The build links what it needs from the PATH here
@@ -40,7 +40,7 @@ jobs:
       # not: "utils_gen.py ... TypeError: expected an Element, not
       # ElementTree".
       - name: Python for meson
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -51,13 +51,15 @@ jobs:
         run: gmake tool-versions
 
       # Readable without a login, as the failure below: which tools the
-      # build will link into its own PATH.
+      # build will link into its own PATH. One notice, not one a tool.
       - name: Say where the tools are
         shell: bash
         run: |
+          tools=""
           for tool in meson ninja cmake nasm; do
-            echo "::notice title=tool ${tool}::$(which ${tool} || echo missing) $(${tool} --version 2>&1 | head -n 1)"
+            tools="${tools}${tool}: $(which ${tool} || echo missing) $(${tool} --version 2>&1 | head -n 1)%0A"
           done
+          echo "::notice title=tools::${tools}"
 
       - name: Determine version
         id: version
@@ -118,7 +120,7 @@ jobs:
           echo "::notice title=sha256::$(awk '{printf "%s  %s%%0A", $1, $2}' SHA256SUMS.txt)"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           if-no-files-found: error
           path: |
@@ -126,7 +128,7 @@ jobs:
             build/output/SHA256SUMS.txt
 
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         if: startsWith(github.ref, 'refs/tags/')
         with:
           fail_on_unmatched_files: true
