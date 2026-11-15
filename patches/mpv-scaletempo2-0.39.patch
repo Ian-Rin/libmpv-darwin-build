@@ -1,0 +1,672 @@
+af_scaletempo2 as it is in mpv 0.39.0.
+
+mpv 0.36 changes the speed of the sound with this filter, as it was before
+the fixes of 0.37: a change of speed gave a spike of too many or too few
+samples and a jump in the timestamps (f52cf90fe), the first block was mixed
+with whatever the buffer held (33d6d0f31), and the sound stayed off by up
+to the search interval on the way back to 1x (c0728249a). Heard and seen
+as a hitch when a long press at 2x or 3x begins and when it ends.
+The three files are those of v0.39.0, unchanged; they use nothing that
+0.36 does not have.
+
+--- a/audio/filter/af_scaletempo2.c
++++ b/audio/filter/af_scaletempo2.c
+@@ -8,21 +8,20 @@
+ #include "options/m_option.h"
+ 
+ struct priv {
+-    struct mp_scaletempo2 data;
++    struct mp_scaletempo2 *data;
+     struct mp_pin *in_pin;
+     struct mp_aframe *cur_format;
+     struct mp_aframe_pool *out_pool;
+     bool sent_final;
+     struct mp_aframe *pending;
+     bool initialized;
+-    double frame_delay;
+     float speed;
+ };
+ 
+ static bool init_scaletempo2(struct mp_filter *f);
+-static void reset(struct mp_filter *f);
++static void af_scaletempo2_reset(struct mp_filter *f);
+ 
+-static void process(struct mp_filter *f)
++static void af_scaletempo2_process(struct mp_filter *f)
+ {
+     struct priv *p = f->priv;
+ 
+@@ -30,7 +29,7 @@
+         return;
+ 
+     while (!p->initialized || !p->pending ||
+-           !mp_scaletempo2_frames_available(&p->data))
++           !mp_scaletempo2_frames_available(p->data, p->speed))
+     {
+         bool eof = false;
+         if (!p->pending || !mp_aframe_get_size(p->pending)) {
+@@ -65,14 +64,16 @@
+         if (p->pending && !format_change && !p->sent_final) {
+             int frame_size = mp_aframe_get_size(p->pending);
+             uint8_t **planes = mp_aframe_get_data_ro(p->pending);
+-            int read = mp_scaletempo2_fill_input_buffer(&p->data,
+-                planes, frame_size, final);
+-            p->frame_delay += read;
++            int read = mp_scaletempo2_fill_input_buffer(p->data,
++                planes, frame_size, p->speed);
+             mp_aframe_skip_samples(p->pending, read);
+         }
+-        p->sent_final |= final;
++        if (final && p->pending && !p->sent_final) {
++            mp_scaletempo2_set_final(p->data);
++            p->sent_final = true;
++        }
+ 
+-        if (mp_scaletempo2_frames_available(&p->data)) {
++        if (mp_scaletempo2_frames_available(p->data, p->speed)) {
+             if (eof) {
+                 mp_pin_out_repeat_eof(p->in_pin); // drain more next time
+             }
+@@ -82,18 +83,15 @@
+             if (eof) {
+                 mp_pin_in_write(f->ppins[1], MP_EOF_FRAME);
+                 return;
+-            } else if (format_change) {
+-                // go on with proper reinit on the next iteration
+-                p->initialized = false;
+-                p->sent_final = false;
+             }
++            // for format change go on with proper reinit on the next iteration
+         }
+     }
+ 
+     assert(p->pending);
+-    if (mp_scaletempo2_frames_available(&p->data)) {
++    if (mp_scaletempo2_frames_available(p->data, p->speed)) {
+         struct mp_aframe *out = mp_aframe_new_ref(p->cur_format);
+-        int out_samples = p->data.ola_hop_size;
++        int out_samples = p->data->ola_hop_size;
+         if (mp_aframe_pool_allocate(p->out_pool, out, out_samples) < 0) {
+             talloc_free(out);
+             goto error;
+@@ -103,17 +101,30 @@
+ 
+         uint8_t **planes = mp_aframe_get_data_rw(out);
+         assert(planes);
+-        assert(mp_aframe_get_planes(out) == p->data.channels);
++        assert(mp_aframe_get_planes(out) == p->data->channels);
+ 
+-        out_samples = mp_scaletempo2_fill_buffer(&p->data,
++        out_samples = mp_scaletempo2_fill_buffer(p->data,
+             (float**)planes, out_samples, p->speed);
+ 
+         double pts = mp_aframe_get_pts(p->pending);
+-        p->frame_delay -= out_samples * p->speed;
+-
+         if (pts != MP_NOPTS_VALUE) {
+-            double delay = p->frame_delay / mp_aframe_get_effective_rate(out);
+-            mp_aframe_set_pts(out, pts - delay);
++            double frame_delay = mp_scaletempo2_get_latency(p->data, p->speed)
++                + out_samples * p->speed;
++            mp_aframe_set_pts(out, pts - frame_delay / mp_aframe_get_effective_rate(out));
++
++            if (p->sent_final) {
++                double remain_pts = pts - mp_aframe_get_pts(out);
++                double rate = mp_aframe_get_effective_rate(out) / p->speed;
++                int max_samples = MPMAX(0, (int) (remain_pts * rate));
++                // truncate final packet to expected length
++                if (out_samples >= max_samples) {
++                    out_samples = max_samples;
++
++                    // reset the filter to ensure it stops generating audio
++                    // and mp_scaletempo2_frames_available returns false
++                    mp_scaletempo2_reset(p->data);
++                }
++            }
+         }
+ 
+         mp_aframe_set_size(out, out_samples);
+@@ -137,16 +148,15 @@
+     mp_aframe_reset(p->cur_format);
+     p->initialized = true;
+     p->sent_final = false;
+-    p->frame_delay = 0;
+     mp_aframe_config_copy(p->cur_format, p->pending);
+ 
+-    mp_scaletempo2_init(&p->data, mp_aframe_get_channels(p->pending),
++    mp_scaletempo2_init(p->data, mp_aframe_get_channels(p->pending),
+         mp_aframe_get_rate(p->pending));
+ 
+     return true;
+ }
+ 
+-static bool command(struct mp_filter *f, struct mp_filter_command *cmd)
++static bool af_scaletempo2_command(struct mp_filter *f, struct mp_filter_command *cmd)
+ {
+     struct priv *p = f->priv;
+ 
+@@ -159,29 +169,28 @@
+     return false;
+ }
+ 
+-static void reset(struct mp_filter *f)
++static void af_scaletempo2_reset(struct mp_filter *f)
+ {
+     struct priv *p = f->priv;
+-    mp_scaletempo2_reset(&p->data);
+-    p->frame_delay = 0;
++    mp_scaletempo2_reset(p->data);
+     p->initialized = false;
+     TA_FREEP(&p->pending);
+ }
+ 
+-static void destroy(struct mp_filter *f)
++static void af_scaletempo2_destroy(struct mp_filter *f)
+ {
+     struct priv *p = f->priv;
+-    mp_scaletempo2_destroy(&p->data);
+-    talloc_free(p->pending);
++    TA_FREEP(&p->data);
++    TA_FREEP(&p->pending);
+ }
+ 
+ static const struct mp_filter_info af_scaletempo2_filter = {
+     .name = "scaletempo2",
+     .priv_size = sizeof(struct priv),
+-    .process = process,
+-    .command = command,
+-    .reset = reset,
+-    .destroy = destroy,
++    .process = af_scaletempo2_process,
++    .command = af_scaletempo2_command,
++    .reset = af_scaletempo2_reset,
++    .destroy = af_scaletempo2_destroy,
+ };
+ 
+ static struct mp_filter *af_scaletempo2_create(
+@@ -197,7 +206,8 @@
+     mp_filter_add_pin(f, MP_PIN_OUT, "out");
+ 
+     struct priv *p = f->priv;
+-    p->data.opts = talloc_steal(p, options);
++    p->data = talloc_zero(p, struct mp_scaletempo2);
++    p->data->opts = talloc_steal(p, options);
+     p->speed = 1.0;
+     p->cur_format = talloc_steal(p, mp_aframe_create());
+     p->out_pool = mp_aframe_pool_create(p);
+@@ -225,9 +235,9 @@
+         .priv_size = sizeof(OPT_BASE_STRUCT),
+         .priv_defaults = &(const OPT_BASE_STRUCT) {
+             .min_playback_rate = 0.25,
+-            .max_playback_rate = 4.0,
+-            .ola_window_size_ms = 20,
+-            .wsola_search_interval_ms = 30,
++            .max_playback_rate = 8.0,
++            .ola_window_size_ms = 12,
++            .wsola_search_interval_ms = 40,
+         },
+         .options = (const struct m_option[]) {
+             {"search-interval",
+--- a/audio/filter/af_scaletempo2_internals.c
++++ b/audio/filter/af_scaletempo2_internals.c
+@@ -41,19 +41,15 @@
+     return n >= q.lo && n <= q.hi;
+ }
+ 
+-static float **realloc_2d(float **p, int x, int y)
++static void alloc_sample_buffer(struct mp_scaletempo2 *p, float ***ptr, size_t size)
+ {
+-    float **array = realloc(p, sizeof(float*) * x + sizeof(float) * x * y);
+-    float* data = (float*) (array + x);
+-    for (int i = 0; i < x; ++i) {
+-        array[i] = data + i * y;
+-    }
+-    return array;
+-}
++    talloc_free(*ptr);
+ 
+-static void zero_2d(float **a, int x, int y)
+-{
+-    memset(a + x, 0, sizeof(float) * x * y);
++    float **buff = talloc_array(p, float*, p->channels);
++    for (int i = 0; i < p->channels; ++i) {
++        buff[i] = talloc_array(buff, float, size);
++    }
++    *ptr = buff;
+ }
+ 
+ static void zero_2d_partial(float **a, int x, int y)
+@@ -93,15 +89,15 @@
+ }
+ 
+ static float multi_channel_similarity_measure(
+-    const float* dot_prod_a_b,
+-    const float* energy_a, const float* energy_b,
++    const float* dot_prod,
++    const float* energy_target, const float* energy_candidate,
+     int channels)
+ {
+     const float epsilon = 1e-12f;
+     float similarity_measure = 0.0f;
+     for (int n = 0; n < channels; ++n) {
+-        similarity_measure += dot_prod_a_b[n]
+-            / sqrtf(energy_a[n] * energy_b[n] + epsilon);
++        similarity_measure += dot_prod[n] * energy_target[n]
++            / sqrtf(energy_target[n] * energy_candidate[n] + epsilon);
+     }
+     return similarity_measure;
+ }
+@@ -421,18 +417,15 @@
+ {
+     assert(p->input_buffer_frames >= frames);
+     p->input_buffer_frames -= frames;
++    if (p->input_buffer_final_frames > 0) {
++        p->input_buffer_final_frames = MPMAX(0, p->input_buffer_final_frames - frames);
++    }
+     for (int i = 0; i < p->channels; ++i) {
+         memmove(p->input_buffer[i], p->input_buffer[i] + frames,
+             p->input_buffer_frames * sizeof(float));
+     }
+ }
+ 
+-static void read_buffer(struct mp_scaletempo2 *p, int frames, float **dest)
+-{
+-    peek_buffer(p, frames, 0, 0, dest);
+-    seek_buffer(p, frames);
+-}
+-
+ static int write_completed_frames_to(struct mp_scaletempo2 *p,
+     int requested_frames, int dest_offset, float **dest)
+ {
+@@ -456,47 +449,76 @@
+     return rendered_frames;
+ }
+ 
+-static bool can_perform_wsola(struct mp_scaletempo2 *p)
++// next output_time for the given playback_rate
++static double get_updated_time(struct mp_scaletempo2 *p, double playback_rate)
+ {
+-    return p->target_block_index + p->ola_window_size <= p->input_buffer_frames
+-        && p->search_block_index + p->search_block_size <= p->input_buffer_frames;
++    return p->output_time + p->ola_hop_size * playback_rate;
++}
++
++// search_block_index for the given output_time
++static int get_search_block_index(struct mp_scaletempo2 *p, double output_time)
++{
++    return (int)(output_time - p->search_block_center_offset + 0.5);
+ }
+ 
+ // number of frames needed until a wsola iteration can be performed
+-static int frames_needed(struct mp_scaletempo2 *p)
++static int frames_needed(struct mp_scaletempo2 *p, double playback_rate)
+ {
++    int search_block_index =
++        get_search_block_index(p, get_updated_time(p, playback_rate));
+     return MPMAX(0, MPMAX(
+         p->target_block_index + p->ola_window_size - p->input_buffer_frames,
+-        p->search_block_index + p->search_block_size - p->input_buffer_frames));
++        search_block_index + p->search_block_size - p->input_buffer_frames));
++}
++
++static bool can_perform_wsola(struct mp_scaletempo2 *p, double playback_rate)
++{
++    return frames_needed(p, playback_rate) <= 0;
++}
++
++// pad end with silence until a wsola iteration can be performed
++static void add_input_buffer_final_silence(struct mp_scaletempo2 *p, double playback_rate)
++{
++    int needed = frames_needed(p, playback_rate);
++    if (needed <= 0)
++        return; // no silence needed for iteration
++
++    int last_index = needed + p->input_buffer_frames - 1;
++    for (int i = 0; i < p->channels; ++i) {
++        MP_TARRAY_GROW(p, p->input_buffer[i], last_index);
++        float *ch_input = p->input_buffer[i];
++        for (int j = 0; j < needed; ++j) {
++            ch_input[p->input_buffer_frames + j] = 0.0f;
++        }
++    }
++
++    p->input_buffer_added_silence += needed;
++    p->input_buffer_frames += needed;
+ }
+ 
+-static void resize_input_buffer(struct mp_scaletempo2 *p, int size)
++void mp_scaletempo2_set_final(struct mp_scaletempo2 *p)
+ {
+-    p->input_buffer_size = size;
+-    p->input_buffer = realloc_2d(p->input_buffer, p->channels, size);
++    if (p->input_buffer_final_frames <= 0) {
++        p->input_buffer_final_frames = p->input_buffer_frames;
++    }
+ }
+ 
+ int mp_scaletempo2_fill_input_buffer(struct mp_scaletempo2 *p,
+-    uint8_t **planes, int frame_size, bool final)
++    uint8_t **planes, int frame_size, double playback_rate)
+ {
+-    int needed = frames_needed(p);
++    int needed = frames_needed(p, playback_rate);
+     int read = MPMIN(needed, frame_size);
+-    int total_fill = final ? needed : read;
+-    if (total_fill == 0) return 0;
+-
+-    int required_size = total_fill + p->input_buffer_frames;
+-    if (required_size > p->input_buffer_size)
+-        resize_input_buffer(p, required_size);
++    if (read == 0)
++        return 0;
+ 
++    int last_index = read + p->input_buffer_frames - 1;
+     for (int i = 0; i < p->channels; ++i) {
++        MP_TARRAY_GROW(p, p->input_buffer[i], last_index);
+         memcpy(p->input_buffer[i] + p->input_buffer_frames,
+             planes[i], read * sizeof(float));
+-        for (int j = read; j < total_fill; ++j) {
+-            p->input_buffer[p->input_buffer_frames + j] = 0;
+-        }
+     }
+ 
+-    p->input_buffer_frames += total_fill;
++    p->input_buffer_frames += read;
+     return read;
+ }
+ 
+@@ -587,17 +609,13 @@
+     p->target_block_index = optimal_index + p->ola_hop_size;
+ }
+ 
+-static void update_output_time(struct mp_scaletempo2 *p,
+-    float playback_rate, double time_change)
++static void set_output_time(struct mp_scaletempo2 *p, double output_time)
+ {
+-    p->output_time += time_change;
+-    // Center of the search region, in frames.
+-    int search_block_center_index = (int)(p->output_time * playback_rate + 0.5);
+-    p->search_block_index = search_block_center_index
+-        - p->search_block_center_offset;
++    p->output_time = output_time;
++    p->search_block_index = get_search_block_index(p, output_time);
+ }
+ 
+-static void remove_old_input_frames(struct mp_scaletempo2 *p, float playback_rate)
++static void remove_old_input_frames(struct mp_scaletempo2 *p)
+ {
+     const int earliest_used_index = MPMIN(
+         p->target_block_index, p->search_block_index);
+@@ -607,46 +625,69 @@
+     // Remove frames from input and adjust indices accordingly.
+     seek_buffer(p, earliest_used_index);
+     p->target_block_index -= earliest_used_index;
+-
+-    // Adjust output index.
+-    double output_time_change = ((double) earliest_used_index) / playback_rate;
+-    assert(p->output_time >= output_time_change);
+-    update_output_time(p, playback_rate, -output_time_change);
++    p->output_time -= earliest_used_index;
++    p->search_block_index -= earliest_used_index;
+ }
+ 
+-static bool run_one_wsola_iteration(struct mp_scaletempo2 *p, float playback_rate)
++static bool run_one_wsola_iteration(struct mp_scaletempo2 *p, double playback_rate)
+ {
+-    if (!can_perform_wsola(p)){
++    if (!can_perform_wsola(p, playback_rate)) {
+         return false;
+     }
+ 
++    set_output_time(p, get_updated_time(p, playback_rate));
++    remove_old_input_frames(p);
++
++    assert(p->search_block_index + p->search_block_size <= p->input_buffer_frames);
++
+     get_optimal_block(p);
+ 
+     // Overlap-and-add.
+     for (int k = 0; k < p->channels; ++k) {
+         float* ch_opt_frame = p->optimal_block[k];
+         float* ch_output = p->wsola_output[k] + p->num_complete_frames;
+-        for (int n = 0; n < p->ola_hop_size; ++n) {
+-            ch_output[n] = ch_output[n] * p->ola_window[p->ola_hop_size + n] +
+-                ch_opt_frame[n] * p->ola_window[n];
+-        }
++        if (p->wsola_output_started) {
++            for (int n = 0; n < p->ola_hop_size; ++n) {
++                ch_output[n] = ch_output[n] * p->ola_window[p->ola_hop_size + n] +
++                    ch_opt_frame[n] * p->ola_window[n];
++            }
+ 
+-        // Copy the second half to the output.
+-        memcpy(&ch_output[p->ola_hop_size], &ch_opt_frame[p->ola_hop_size],
+-               sizeof(*ch_opt_frame) * p->ola_hop_size);
++            // Copy the second half to the output.
++            memcpy(&ch_output[p->ola_hop_size], &ch_opt_frame[p->ola_hop_size],
++                   sizeof(*ch_opt_frame) * p->ola_hop_size);
++        } else {
++            // No overlap for the first iteration.
++            memcpy(ch_output, ch_opt_frame,
++                   sizeof(*ch_opt_frame) * p->ola_window_size);
++        }
+     }
+ 
+     p->num_complete_frames += p->ola_hop_size;
+-    update_output_time(p, playback_rate, p->ola_hop_size);
+-    remove_old_input_frames(p, playback_rate);
++    p->wsola_output_started = true;
+     return true;
+ }
+ 
++static int read_input_buffer(struct mp_scaletempo2 *p, int dest_size, float **dest)
++{
++    int frames_to_copy = MPMIN(dest_size, p->input_buffer_frames - p->target_block_index);
++
++    if (frames_to_copy <= 0)
++        return 0; // There is nothing to read from input buffer; return.
++
++    peek_buffer(p, frames_to_copy, p->target_block_index, 0, dest);
++    seek_buffer(p, frames_to_copy);
++    return frames_to_copy;
++}
++
+ int mp_scaletempo2_fill_buffer(struct mp_scaletempo2 *p,
+-    float **dest, int dest_size, float playback_rate)
++    float **dest, int dest_size, double playback_rate)
+ {
+     if (playback_rate == 0) return 0;
+ 
++    if (p->input_buffer_final_frames > 0) {
++        add_input_buffer_final_silence(p, playback_rate);
++    }
++
+     // Optimize the muted case to issue a single clear instead of performing
+     // the full crossfade and clearing each crossfaded frame.
+     if (playback_rate < p->opts->min_playback_rate
+@@ -680,9 +721,16 @@
+     // Optimize the most common |playback_rate| ~= 1 case to use a single copy
+     // instead of copying frame by frame.
+     if (p->ola_window_size <= faster_step && slower_step >= p->ola_window_size) {
+-        int frames_to_copy = MPMIN(dest_size, p->input_buffer_frames);
+-        read_buffer(p, frames_to_copy, dest);
+-        return frames_to_copy;
++
++        if (p->wsola_output_started) {
++            p->wsola_output_started = false;
++
++            // sync audio precisely again
++            set_output_time(p, p->target_block_index);
++            remove_old_input_frames(p);
++        }
++
++        return read_input_buffer(p, dest_size, dest);
+     }
+ 
+     int rendered_frames = 0;
+@@ -694,32 +742,31 @@
+     return rendered_frames;
+ }
+ 
+-bool mp_scaletempo2_frames_available(struct mp_scaletempo2 *p)
++double mp_scaletempo2_get_latency(struct mp_scaletempo2 *p, double playback_rate)
+ {
+-    return can_perform_wsola(p) || p->num_complete_frames > 0;
++    return p->input_buffer_frames - p->output_time
++        - p->input_buffer_added_silence
++        + p->num_complete_frames * playback_rate;
+ }
+ 
+-void mp_scaletempo2_destroy(struct mp_scaletempo2 *p)
++bool mp_scaletempo2_frames_available(struct mp_scaletempo2 *p, double playback_rate)
+ {
+-    free(p->ola_window);
+-    free(p->transition_window);
+-    free(p->wsola_output);
+-    free(p->optimal_block);
+-    free(p->search_block);
+-    free(p->target_block);
+-    free(p->input_buffer);
+-    free(p->energy_candidate_blocks);
++    return (p->input_buffer_final_frames > p->target_block_index &&
++            p->input_buffer_final_frames > 0)
++        || can_perform_wsola(p, playback_rate)
++        || p->num_complete_frames > 0;
+ }
+ 
+ void mp_scaletempo2_reset(struct mp_scaletempo2 *p)
+ {
+     p->input_buffer_frames = 0;
++    p->input_buffer_final_frames = 0;
++    p->input_buffer_added_silence = 0;
+     p->output_time = 0.0;
+     p->search_block_index = 0;
+     p->target_block_index = 0;
+-    // Clear the queue of decoded packets.
+-    zero_2d(p->wsola_output, p->channels, p->wsola_output_size);
+     p->num_complete_frames = 0;
++    p->wsola_output_started = false;
+ }
+ 
+ // Return a "periodic" Hann window. This is the first L samples of an L+1
+@@ -736,9 +783,10 @@
+ {
+     p->muted_partial_frame = 0;
+     p->output_time = 0;
+-    p->search_block_center_offset = 0;
+     p->search_block_index = 0;
++    p->target_block_index = 0;
+     p->num_complete_frames = 0;
++    p->wsola_output_started = false;
+     p->channels = channels;
+ 
+     p->samples_per_second = rate;
+@@ -771,26 +819,26 @@
+     //                   1,          ...         |num_candidate_blocks|
+     p->search_block_center_offset = p->num_candidate_blocks / 2
+         + (p->ola_window_size / 2 - 1);
+-    p->ola_window = realloc(p->ola_window, sizeof(float) * p->ola_window_size);
++    MP_RESIZE_ARRAY(p, p->ola_window, p->ola_window_size);
+     get_symmetric_hanning_window(p->ola_window_size, p->ola_window);
+-    p->transition_window = realloc(p->transition_window,
+-        sizeof(float) * p->ola_window_size * 2);
++    MP_RESIZE_ARRAY(p, p->transition_window, p->ola_window_size * 2);
+     get_symmetric_hanning_window(2 * p->ola_window_size, p->transition_window);
+ 
+     p->wsola_output_size = p->ola_window_size + p->ola_hop_size;
+-    p->wsola_output = realloc_2d(p->wsola_output, p->channels, p->wsola_output_size);
+-    // Initialize for overlap-and-add of the first block.
+-    zero_2d(p->wsola_output, p->channels, p->wsola_output_size);
++    alloc_sample_buffer(p, &p->wsola_output, p->wsola_output_size);
+ 
+     // Auxiliary containers.
+-    p->optimal_block = realloc_2d(p->optimal_block, p->channels, p->ola_window_size);
++    alloc_sample_buffer(p, &p->optimal_block, p->ola_window_size);
+     p->search_block_size = p->num_candidate_blocks + (p->ola_window_size - 1);
+-    p->search_block = realloc_2d(p->search_block, p->channels, p->search_block_size);
+-    p->target_block = realloc_2d(p->target_block, p->channels, p->ola_window_size);
++    alloc_sample_buffer(p, &p->search_block, p->search_block_size);
++    alloc_sample_buffer(p, &p->target_block, p->ola_window_size);
+ 
+-    resize_input_buffer(p, 4 * MPMAX(p->ola_window_size, p->search_block_size));
+     p->input_buffer_frames = 0;
++    p->input_buffer_final_frames = 0;
++    p->input_buffer_added_silence = 0;
++    size_t initial_size = 4 * MPMAX(p->ola_window_size, p->search_block_size);
++    alloc_sample_buffer(p, &p->input_buffer, initial_size);
+ 
+-    p->energy_candidate_blocks = realloc(p->energy_candidate_blocks,
+-        sizeof(float) * p->channels * p->num_candidate_blocks);
++    MP_RESIZE_ARRAY(p, p->energy_candidate_blocks,
++        p->channels * p->num_candidate_blocks);
+ }
+--- a/audio/filter/af_scaletempo2_internals.h
++++ b/audio/filter/af_scaletempo2_internals.h
+@@ -53,18 +53,19 @@
+     int samples_per_second;
+     // If muted, keep track of partial frames that should have been skipped over.
+     double muted_partial_frame;
+-    // Book keeping of the current time of generated audio, in frames. This
+-    // should be appropriately updated when out samples are generated, regardless
+-    // of whether we push samples out when fill_buffer() is called or we store
+-    // audio in |wsola_output| for the subsequent calls to fill_buffer().
+-    // Furthermore, if samples from |audio_buffer| are evicted then this
+-    // member variable should be updated based on |playback_rate|.
+-    // Note that this member should be updated ONLY by calling update_output_time(),
+-    // so that |search_block_index| is update accordingly.
++    // Book keeping of the current time of generated audio, in frames.
++    // Corresponds to the center of |search_block|. This is increased in
++    // intervals of |ola_hop_size| multiplied by the current playback_rate,
++    // for every WSOLA iteration. This tracks the number of advanced frames as
++    // a double to achieve accurate playback rates beyond the integer precision
++    // of |search_block_index|.
++    // Needs to be adjusted like any other index when frames are evicted from
++    // |input_buffer|.
+     double output_time;
+     // The offset of the center frame of |search_block| w.r.t. its first frame.
+     int search_block_center_offset;
+-    // Index of the beginning of the |search_block|, in frames.
++    // Index of the beginning of the |search_block|, in frames. This may be
++    // negative, which is handled by |peek_audio_with_zero_prepend|.
+     int search_block_index;
+     // Number of Blocks to search to find the most similar one to the target
+     // frame.
+@@ -80,6 +81,9 @@
+     // them and can be copied to output if fill_buffer() is called. It also
+     // specifies the index where the next WSOLA window has to overlap-and-add.
+     int num_complete_frames;
++    // Whether |wsola_output| contains an additional |ola_hop_size| of overlap
++    // frames for the next iteration.
++    bool wsola_output_started;
+     // Overlap-and-add window.
+     float *ola_window;
+     // Transition window, used to update |optimal_block| by a weighted sum of
+@@ -106,16 +110,24 @@
+     float **target_block;
+     // Buffered audio data.
+     float **input_buffer;
+-    int input_buffer_size;
+     int input_buffer_frames;
++    // How many frames in |input_buffer| need to be flushed by padding with
++    // silence to process the final packet. While this is nonzero, the filter
++    // appends silence to |input_buffer| until these frames are processed.
++    int input_buffer_final_frames;
++    // How many additional frames of silence have been added to |input_buffer|
++    // for padding after the final packet.
++    int input_buffer_added_silence;
+     float *energy_candidate_blocks;
+ };
+ 
+ void mp_scaletempo2_destroy(struct mp_scaletempo2 *p);
+ void mp_scaletempo2_reset(struct mp_scaletempo2 *p);
+ void mp_scaletempo2_init(struct mp_scaletempo2 *p, int channels, int rate);
++double mp_scaletempo2_get_latency(struct mp_scaletempo2 *p, double playback_rate);
+ int mp_scaletempo2_fill_input_buffer(struct mp_scaletempo2 *p,
+-    uint8_t **planes, int frame_size, bool final);
++    uint8_t **planes, int frame_size, double playback_rate);
++void mp_scaletempo2_set_final(struct mp_scaletempo2 *p);
+ int mp_scaletempo2_fill_buffer(struct mp_scaletempo2 *p,
+-    float **dest, int dest_size, float playback_rate);
+-bool mp_scaletempo2_frames_available(struct mp_scaletempo2 *p);
++    float **dest, int dest_size, double playback_rate);
++bool mp_scaletempo2_frames_available(struct mp_scaletempo2 *p, double playback_rate);
