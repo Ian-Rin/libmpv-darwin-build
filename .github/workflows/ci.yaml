@@ -77,17 +77,22 @@ jobs:
 
       - name: Build
         # bash, for pipefail: the build's failure, not tee's success.
+        # -k: a package that fails does not stop the ones that do not need
+        # it, so that one run says all that is wrong with them, not the
+        # first.
         shell: bash
         run: |
           VERSION=${{ steps.version.outputs.version }}
-          gmake build/output/libmpv-xcframeworks_${VERSION}_ios-universal-video-default.tar.gz 2>&1 | tee build.log
+          gmake -k build/output/libmpv-xcframeworks_${VERSION}_ios-universal-video-default.tar.gz 2>&1 | tee build.log
 
-      # A run's log needs a login to read; its annotations do not. The lines
-      # that say what failed, and the log's end, go there.
+      # A run's log needs a login to read; its annotations do not (ten of a
+      # kind for a step). What failed, the errors, the lines before each
+      # failure and the log's end go there.
       - name: Say why the build failed
         if: failure()
         shell: bash
         run: |
+          set +e +o pipefail
           test -f build.log || exit 0
           annotate() {
             local title=$1 body
@@ -95,9 +100,14 @@ jobs:
             test -n "$body" && echo "::error title=${title}::${body}"
             return 0
           }
-          grep -n -E "error:|Error:|FAILED|fatal|undefined|Undefined|No such file|not found" build.log | tail -n 30 | annotate "errors in the build log"
-          tail -n 90 build.log | head -n 30 | annotate "build log 90 to 60 lines from its end"
-          tail -n 60 build.log | head -n 30 | annotate "build log 60 to 30 lines from its end"
+          grep -n -E "^gmake(\[[0-9]+\])?: \*\*\* " build.log | head -n 40 | annotate "failed targets"
+          grep -E "fatal error:|: error:|^FAILED|ERROR:|Traceback|Error: |^ld: |Undefined symbols|No such file or directory|command not found" build.log \
+            | awk '!seen[$0]++' | head -n 40 | annotate "errors in the build log"
+          grep -n -B 14 -E "^gmake(\[[0-9]+\])?: \*\*\* " build.log > before.log
+          sed -n '1,30p' before.log | annotate "before the failures 1"
+          sed -n '31,60p' before.log | annotate "before the failures 2"
+          sed -n '61,90p' before.log | annotate "before the failures 3"
+          sed -n '91,120p' before.log | annotate "before the failures 4"
           tail -n 30 build.log | annotate "build log last 30 lines"
 
       - name: Checksum
