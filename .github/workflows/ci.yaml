@@ -8,7 +8,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, mpv-0.39]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -32,7 +32,20 @@ jobs:
       # Found CMake: NO"). The build links what it needs from the PATH here
       # into a PATH of its own.
       - name: Install requirements
-        run: brew install go meson ninja nasm make cmake
+        run: brew install go ninja nasm make cmake
+
+      # meson from pip under a Python of the time this was last built (late
+      # 2024), not Homebrew's: its meson runs under Homebrew's Python, 3.15
+      # by now, and libplacebo 7.349's generators (run by meson's Python) do
+      # not: "utils_gen.py ... TypeError: expected an Element, not
+      # ElementTree".
+      - name: Python for meson
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install meson
+        run: python -m pip install meson==1.6.0
 
       - name: Print tool versions
         run: gmake tool-versions

@@ -9,6 +9,8 @@ patch -p1 <${PROJECT_DIR}/patches/ffmpeg-fix-vp9-hwaccel.patch
 #patch -p1 <${PROJECT_DIR}/patches/ffmpeg-fix-hls-mp4-seek.patch
 patch -p1 <${PROJECT_DIR}/patches/ffmpeg-fix-ios-hdr-texture.patch
 patch -p1 <${PROJECT_DIR}/patches/ffmpeg-fix-dash-base-url-escape.patch
+# After ffmpeg-fix-ios-hdr-texture.patch (the same file).
+patch -p1 <${PROJECT_DIR}/patches/ffmpeg-videotoolbox-async.patch
 
 cp ${PROJECT_DIR}/scripts/ffmpeg/meson.* .
 
